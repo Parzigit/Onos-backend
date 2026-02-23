@@ -1,11 +1,10 @@
 """
-DLBMT Engine – Distributed Load Balancing Mechanism with Multi-level Threshold
-Implements all formulas (Eq 1-10) and algorithms (Algorithm 1 & 2) from the paper:
-"Enhanced load balancing technique for SDN controllers: A multi-threshold approach
- with migration of switches" (Computer Communications 238, 2025)
+Faithful
 """
 
+import csv
 import math
+import os
 import time
 import logging
 from dataclasses import dataclass, field
@@ -36,12 +35,15 @@ class ControllerLevel(IntEnum):
 
 
 # Threshold boundaries Q[1..4]
-THRESHOLDS = [25, 50, 75, 100]
+THRESHOLDS = [25.0, 50.0, 75.0]
 
 # Default weight coefficients (a + b + c = 1)
 DEFAULT_A = 0.4   # CPU weight
 DEFAULT_B = 0.3   # Memory weight
 DEFAULT_C = 0.3   # Bandwidth weight
+
+# Effectiveness threshold R — if R > θ then accept migration
+EFFECTIVENESS_THRESHOLD_R = 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +106,7 @@ class Controller:
 
 @dataclass
 class MigrationRecord:
-    """Record of a switch migration event."""
+    """Record of a switch migration event with full paper metrics."""
     timestamp: float
     switch_id: str
     source_controller: str
@@ -113,10 +115,27 @@ class MigrationRecord:
     source_load_after: float
     target_load_before: float
     target_load_after: float
-    migration_efficiency: float
-    migration_cost: float
-    imbalance_before: float
-    imbalance_after: float
+    migration_efficiency: float = 0.0
+    migration_cost: float = 0.0
+    imbalance_before: float = 0.0
+    imbalance_after: float = 0.0
+    # Paper metrics
+    psi_switch: float = 0.0           # ψ(si_j)
+    psi_mean: float = 0.0             # ψ̄
+    rho_size: int = 0                 # |ρ| : migration set size
+    domain_size: int = 0              # m : total switches in source domain
+    dc_star: float = 0.0              # DC*
+    dc_before_pair: float = 0.0       # DC(cj,ck) before
+    dc_after_pair: float = 0.0        # DC(cj,ck) after
+    theta: float = 0.0                # θ : effectiveness score
+    cost_f: float = 0.0               # f(si_j, ck)
+    pred_source_load: float = 0.0     # LR*_cj
+    pred_target_load: float = 0.0     # LR*_ck
+    target_level_star: int = 0        # C*k
+    global_imbalance_before: float = 0.0
+    global_imbalance_after: float = 0.0
+    all_loads_before: str = ""
+    all_loads_after: str = ""
 
     def to_dict(self):
         return {
@@ -129,10 +148,27 @@ class MigrationRecord:
             "source_load_after": round(self.source_load_after, 2),
             "target_load_before": round(self.target_load_before, 2),
             "target_load_after": round(self.target_load_after, 2),
-            "migration_efficiency": round(self.migration_efficiency, 6),
+            "migration_efficiency": round(self.migration_efficiency, 4),
             "migration_cost": round(self.migration_cost, 4),
             "imbalance_before": round(self.imbalance_before, 4),
             "imbalance_after": round(self.imbalance_after, 4),
+            # Paper metrics
+            "psi_switch": round(self.psi_switch, 4),
+            "psi_mean": round(self.psi_mean, 4),
+            "rho_size": self.rho_size,
+            "domain_size": self.domain_size,
+            "dc_star": round(self.dc_star, 6),
+            "dc_before_pair": round(self.dc_before_pair, 6),
+            "dc_after_pair": round(self.dc_after_pair, 6),
+            "theta": round(self.theta, 6),
+            "cost_f": round(self.cost_f, 6),
+            "pred_source_load": round(self.pred_source_load, 2),
+            "pred_target_load": round(self.pred_target_load, 2),
+            "target_level_star": self.target_level_star,
+            "global_imbalance_before": round(self.global_imbalance_before, 6),
+            "global_imbalance_after": round(self.global_imbalance_after, 6),
+            "all_loads_before": self.all_loads_before,
+            "all_loads_after": self.all_loads_after,
         }
 
 
@@ -145,6 +181,12 @@ class DLBMTEngine:
     Core DLBMT algorithm engine.
     Implements load calculation, multi-level thresholding, and switch migration
     selection as described in the paper.
+
+    Aligned with the real Ryu+Mininet engine:
+    - ψ-based migration cost f(si_j, ck) = ψ(si_j) × h_ik
+    - DC* post-migration imbalance using global average predicted load
+    - R > θ effectiveness threshold for migration acceptance
+    - Global imbalance D_global = max pairwise DC
     """
 
     def __init__(self, a: float = DEFAULT_A, b: float = DEFAULT_B, c: float = DEFAULT_C):
@@ -182,7 +224,7 @@ class DLBMTEngine:
         return [c for c in self.controllers.values() if c.active]
 
     # -----------------------------------------------------------------------
-    # Eq. 1: Per-switch resource usage on controller
+    # Eq. 1: Per-switch resource usage on controller  £(si, cj)
     # -----------------------------------------------------------------------
 
     def compute_switch_resource_usage(self, switch: Switch, controller: Controller) -> float:
@@ -193,6 +235,22 @@ class DLBMTEngine:
         cpu_ratio = switch.load_cpu / controller.capacity_cpu if controller.capacity_cpu > 0 else 0
         mem_ratio = switch.load_mem / controller.capacity_mem if controller.capacity_mem > 0 else 0
         bw_ratio = switch.load_bw / controller.capacity_bw if controller.capacity_bw > 0 else 0
+
+        usage = self.a * cpu_ratio + self.b * mem_ratio + self.c * bw_ratio
+        return min(usage, 1.0)
+
+    # -----------------------------------------------------------------------
+    # Eq. 7: Per-switch resource usage on TARGET controller  £ij_k
+    # -----------------------------------------------------------------------
+
+    def compute_switch_resource_on_target(self, switch: Switch, target_ctrl: Controller) -> float:
+        """
+        Eq. 7: £_kij = a·(LoadCPU/CPU_k) + b·(LoadMem/Mem_k) + c·(LoadBw/Bw_k)
+        Resource usage of switch on the target controller (different capacity).
+        """
+        cpu_ratio = switch.load_cpu / target_ctrl.capacity_cpu if target_ctrl.capacity_cpu > 0 else 0
+        mem_ratio = switch.load_mem / target_ctrl.capacity_mem if target_ctrl.capacity_mem > 0 else 0
+        bw_ratio = switch.load_bw / target_ctrl.capacity_bw if target_ctrl.capacity_bw > 0 else 0
 
         usage = self.a * cpu_ratio + self.b * mem_ratio + self.c * bw_ratio
         return min(usage, 1.0)
@@ -224,12 +282,16 @@ class DLBMTEngine:
     def determine_level(self, load: float) -> ControllerLevel:
         """
         Algorithm 1: Determine controller level based on load.
-        Q[1]=25, Q[2]=50, Q[3]=75, Q[4]=100
+        Q[1]=25, Q[2]=50, Q[3]=75
         """
-        for i, threshold in enumerate(THRESHOLDS):
-            if load < threshold:
-                return ControllerLevel(i + 1)
-        return ControllerLevel.OVERLOAD
+        if load < THRESHOLDS[0]:
+            return ControllerLevel.IDLE
+        elif load < THRESHOLDS[1]:
+            return ControllerLevel.NORMAL
+        elif load < THRESHOLDS[2]:
+            return ControllerLevel.HIGH
+        else:
+            return ControllerLevel.OVERLOAD
 
     def update_controller_levels(self) -> Dict[str, bool]:
         """
@@ -251,22 +313,22 @@ class DLBMTEngine:
         return level_changes
 
     # -----------------------------------------------------------------------
-    # Eq. 4: Migration candidate selection ratio
+    # Eq. 4: Migration ratio ψ(si_j) — resource-to-distance ratio
     # -----------------------------------------------------------------------
 
     def compute_migration_ratio(self, switch: Switch, controller: Controller) -> float:
         """
-        Eq. 4: ψ_sji = (£_ji * 100) / h_mi
-        Ratio of resources consumed by switch to distance from controller.
+        Eq. 4: ψ(si_j) = (£(si, cj) * 100) / h_mi
+        Higher ψ means the switch is resource-heavy relative to its distance.
         """
         usage = self.compute_switch_resource_usage(switch, controller)
         distance = self.get_distance(switch.id, controller.id)
-        if distance <= 0:
-            distance = 1.0
+        if distance < 0.001:
+            distance = 0.001
         return (usage * 100.0) / distance
 
     # -----------------------------------------------------------------------
-    # Eq. 5 & 6: Post-migration load calculation
+    # Eq. 5 & 6: Post-migration load prediction
     # -----------------------------------------------------------------------
 
     def compute_source_load_after_migration(self, source_ctrl: Controller,
@@ -281,77 +343,319 @@ class DLBMTEngine:
                                              switch: Switch) -> float:
         """
         Eq. 6: LR*_ck = LR_ck + (£_kij * 100)
-        Eq. 7: £_kij = a·(LoadCPU/CPU_k) + b·(LoadMem/Mem_k) + c·(LoadBw/Bw_k)
         Uses target controller's capacity for the calculation.
         """
-        # Eq. 7: Resource usage of switch on TARGET controller
         usage_on_target = self.compute_switch_resource_on_target(switch, target_ctrl)
-        return target_ctrl.load_percentage + (usage_on_target * 100.0)
-
-    def compute_switch_resource_on_target(self, switch: Switch,
-                                           target_ctrl: Controller) -> float:
-        """
-        Eq. 7: £_kij = a·(LoadCPU/CPU_k) + b·(LoadMem/Mem_k) + c·(LoadBw/Bw_k)
-        Resource usage of switch on the target controller (different capacity).
-        """
-        cpu_ratio = switch.load_cpu / target_ctrl.capacity_cpu if target_ctrl.capacity_cpu > 0 else 0
-        mem_ratio = switch.load_mem / target_ctrl.capacity_mem if target_ctrl.capacity_mem > 0 else 0
-        bw_ratio = switch.load_bw / target_ctrl.capacity_bw if target_ctrl.capacity_bw > 0 else 0
-
-        usage = self.a * cpu_ratio + self.b * mem_ratio + self.c * bw_ratio
-        return min(usage, 1.0)
+        return min(target_ctrl.load_percentage + (usage_on_target * 100.0), 100.0)
 
     # -----------------------------------------------------------------------
-    # Eq. 8: Degree of load imbalance
+    # Pairwise imbalance DC(cj, ck)
     # -----------------------------------------------------------------------
 
-    def compute_degree_of_imbalance(self, lr_source_after: float, lr_target_after: float,
-                                     avg_load_after: float) -> float:
+    def _pairwise_imbalance(self, c1: Controller, c2: Controller) -> float:
         """
-        Eq. 8: DC(c*j,ck) = sqrt(0.5 * ((LR*_cj - LR*)² + (LR*_ck - LR*)²)) / LR*
+        DC(cj, ck) = |L(cj) - L(ck)| / max(L(cj), L(ck))
+        Load imbalance degree between two controllers.
         """
-        if avg_load_after <= 0:
-            return float('inf')
-
-        variance = 0.5 * ((lr_source_after - avg_load_after) ** 2 +
-                          (lr_target_after - avg_load_after) ** 2)
-        return math.sqrt(variance) / avg_load_after
-
-    def compute_current_imbalance(self, source_id: str, target_id: str) -> float:
-        """Compute degree of imbalance BEFORE migration (DC(cj,ck))."""
-        source = self.controllers[source_id]
-        target = self.controllers[target_id]
-        active_ctrls = self.get_active_controllers()
-        avg_load = sum(c.load_percentage for c in active_ctrls) / len(active_ctrls) if active_ctrls else 0
-
-        if avg_load <= 0:
-            return float('inf')
-
-        variance = 0.5 * ((source.load_percentage - avg_load) ** 2 +
-                          (target.load_percentage - avg_load) ** 2)
-        return math.sqrt(variance) / avg_load
-
-    # -----------------------------------------------------------------------
-    # Eq. 9 & 10: Migration efficiency and cost
-    # -----------------------------------------------------------------------
-
-    def compute_migration_cost(self, switch: Switch, target_ctrl: Controller) -> float:
-        """
-        Eq. 10: f(sji, ck) = (£_kij * 100) · min(h_ik)
-        """
-        usage_on_target = self.compute_switch_resource_on_target(switch, target_ctrl)
-        distance = self.get_distance(switch.id, target_ctrl.id)
-        cost = (usage_on_target * 100.0) * distance
-        return max(cost, 0.001)  # Avoid division by zero
-
-    def compute_migration_efficiency(self, dc_after: float, dc_before: float,
-                                      migration_cost: float) -> float:
-        """
-        Eq. 9: ϑ_jk = |DC*(cj,ck) - DC(cj,ck)| / f(sji, ck)
-        """
-        if migration_cost <= 0:
+        l1 = c1.load_percentage
+        l2 = c2.load_percentage
+        max_load = max(l1, l2)
+        if max_load < 0.01:
             return 0.0
-        return abs(dc_after - dc_before) / migration_cost
+        return abs(l1 - l2) / max_load
+
+    # -----------------------------------------------------------------------
+    # Eq. 8: DC* — Post-migration imbalance degree
+    # -----------------------------------------------------------------------
+
+    def _dc_star(self, source: Controller, target: Controller,
+                 pred_source_load: float, pred_target_load: float) -> float:
+        """
+        DC*(cj,ck) = ( ½·(|LR*cj - LR*| + |LR*ck - LR*|) ) / LR*
+        Uses global average predicted load LR* where source and target
+        loads are replaced with their post-migration predictions.
+        """
+        active = self.get_active_controllers()
+        if not active:
+            return 0.0
+
+        # Compute LR* — global average with predicted loads substituted
+        total = 0.0
+        for c in active:
+            if c.id == source.id:
+                total += pred_source_load
+            elif c.id == target.id:
+                total += pred_target_load
+            else:
+                total += c.load_percentage
+        lr_star = total / len(active)
+
+        if lr_star < 0.01:
+            return 0.0
+
+        # RMS-style deviation from global average
+        term_j = math.sqrt((pred_source_load - lr_star) ** 2)
+        term_k = math.sqrt((pred_target_load - lr_star) ** 2)
+
+        return (0.5 * (term_j + term_k)) / lr_star
+
+    # -----------------------------------------------------------------------
+    # Global imbalance D_global
+    # -----------------------------------------------------------------------
+
+    def _global_imbalance(self) -> float:
+        """
+        D_global = max over all pairs DC(ci, cj).
+        """
+        active = self.get_active_controllers()
+        if len(active) < 2:
+            return 0.0
+
+        max_dc = 0.0
+        for i in range(len(active)):
+            for j in range(i + 1, len(active)):
+                dc = self._pairwise_imbalance(active[i], active[j])
+                max_dc = max(max_dc, dc)
+        return max_dc
+
+    # -----------------------------------------------------------------------
+    # Eq. 10: Migration cost f(si_j, ck) — ψ-based
+    # -----------------------------------------------------------------------
+
+    def _migration_cost(self, switch: Switch, source: Controller, target: Controller) -> float:
+        """
+        f(si_j, ck) = ψ(si_j) × h_ik
+        Migration cost = ψ(resource-to-distance ratio) × distance to target.
+        """
+        psi_val = self.compute_migration_ratio(switch, source)
+        dist_to_target = self.get_distance(switch.id, target.id)
+        return psi_val * (dist_to_target + 0.001)  # epsilon to avoid zero
+
+    # -----------------------------------------------------------------------
+    # Build migration set ρ
+    # -----------------------------------------------------------------------
+
+    def _build_migration_set(self, source: Controller):
+        """
+        Build migration candidate set ρ.
+        1. Compute ψ for each switch in source's domain
+        2. Compute mean ψ̄ = (1/m) × Σψ
+        3. Only switches with ψ >= ψ̄ enter ρ
+
+        Returns: (rho, psi_values, psi_mean, domain_size)
+        """
+        dom_switches = self.get_switches_in_domain(source.id)
+
+        if not dom_switches:
+            return [], {}, 0.0, 0
+
+        # Compute ψ per switch
+        psi_values: Dict[str, float] = {}
+        psi_sum = 0.0
+        for sw in dom_switches:
+            psi_val = self.compute_migration_ratio(sw, source)
+            psi_values[sw.id] = psi_val
+            psi_sum += psi_val
+
+        # ψ̄ = (1/m) × Σψ
+        m = len(dom_switches)
+        psi_mean = psi_sum / m
+
+        # Only switches with ψ >= ψ̄ enter ρ
+        rho = [sw for sw in dom_switches if psi_values[sw.id] >= psi_mean]
+
+        logger.debug("Migration set ρ for %s: %d / %d switches (ψ̄=%.3f)",
+                      source.id, len(rho), m, psi_mean)
+        return rho, psi_values, psi_mean, m
+
+    # -----------------------------------------------------------------------
+    # Algorithm 2: Find best migration candidate for a source controller
+    # -----------------------------------------------------------------------
+
+    def _find_best_migration(self, source: Controller):
+        """
+        Select optimal (switch, target_controller) pair.
+        1. Build migration set ρ (filter by ψ ≥ ψ̄)
+        2. For each switch in ρ, predict post-migration loads, reclassify target, compute DC*
+        3. Select (switch, target) pair that minimizes DC*, with target remaining IDLE or NORMAL
+        4. Compute effectiveness θ, select if R > θ
+        """
+        # Build migration set ρ
+        rho, psi_values, psi_mean, domain_size = self._build_migration_set(source)
+        if not rho:
+            logger.debug("Empty migration set ρ for %s", source.id)
+            return None
+
+        # Candidate targets: all active controllers except source
+        all_targets = [c for c in self.controllers.values()
+                       if c.active and c.id != source.id]
+
+        if not all_targets:
+            return None
+
+        # Evaluate all (switch, target) pairs
+        candidates = []
+        for sw in rho:
+            sw_usage_on_source = self.compute_switch_resource_usage(sw, source)
+            for tgt in all_targets:
+                sw_usage_on_target = self.compute_switch_resource_on_target(sw, tgt)
+
+                # LR*_cj = LR_cj - (£_ji × 100)
+                pred_source_load = max(source.load_percentage - sw_usage_on_source * 100, 0)
+
+                # LR*_ck = LR_ck + (£ij_k × 100)
+                pred_target_load = min(tgt.load_percentage + sw_usage_on_target * 100, 100)
+
+                # Reclassify target
+                target_level_star = self.determine_level(pred_target_load)
+
+                # Compute DC*
+                dc_star = self._dc_star(source, tgt, pred_source_load, pred_target_load)
+
+                # Current pairwise imbalance DC (for θ computation)
+                dc_before = self._pairwise_imbalance(source, tgt)
+
+                candidates.append({
+                    "switch": sw,
+                    "target": tgt,
+                    "dc_star": dc_star,
+                    "dc_before": dc_before,
+                    "pred_src": pred_source_load,
+                    "pred_tgt": pred_target_load,
+                    "target_level_star": target_level_star,
+                })
+
+        if not candidates:
+            return None
+
+        # Only consider targets where C*k == IDLE(1) or NORMAL(2)
+        valid_candidates = [
+            c for c in candidates
+            if c["target_level_star"] in (ControllerLevel.IDLE, ControllerLevel.NORMAL)
+        ]
+
+        if not valid_candidates:
+            if source.level == ControllerLevel.OVERLOAD:
+                logger.warning(
+                    "Controller %s is OVERLOADED but no valid migration target. "
+                    "A controller should be added.", source.id
+                )
+            else:
+                logger.debug("No valid migration for %s (level=%s)",
+                             source.id, source.level.label)
+            return None
+
+        # Find candidate with minimum DC*
+        best_dc_candidate = min(valid_candidates, key=lambda c: c["dc_star"])
+
+        # Compute effectiveness: θ = |DC* - DC(cj,ck)| / f(si_j, ck)
+        sw = best_dc_candidate["switch"]
+        tgt = best_dc_candidate["target"]
+        dc_star = best_dc_candidate["dc_star"]
+        dc_before = best_dc_candidate["dc_before"]
+
+        cost = self._migration_cost(sw, source, tgt)
+        if cost < 0.001:
+            cost = 0.001
+
+        theta = abs(dc_star - dc_before) / cost
+
+        # If R > θ then select SC
+        if EFFECTIVENESS_THRESHOLD_R > theta:
+            logger.info(
+                "Selected migration %s → %s (DC*=%.4f, θ=%.4f, R=%.1f)",
+                sw.id, tgt.id, dc_star, theta, EFFECTIVENESS_THRESHOLD_R
+            )
+
+            return (sw, tgt, theta, {
+                "cost": cost,
+                "efficiency": theta,
+                "pred_src": best_dc_candidate["pred_src"],
+                "pred_tgt": best_dc_candidate["pred_tgt"],
+                "dc_before": dc_before,
+                "dc_star": dc_star,
+                "src_load_before": source.load_percentage,
+                "tgt_load_before": tgt.load_percentage,
+                # Evaluation metrics
+                "psi_switch": psi_values.get(sw.id, 0.0),
+                "psi_mean": psi_mean,
+                "rho_size": len(rho),
+                "domain_size": domain_size,
+                "theta": theta,
+                "cost_f": cost,
+                "target_level_star": best_dc_candidate["target_level_star"].value,
+            })
+
+        logger.debug("Effectiveness θ=%.4f exceeds R=%.1f, migration rejected",
+                      theta, EFFECTIVENESS_THRESHOLD_R)
+        return None
+
+    # -----------------------------------------------------------------------
+    # Execute migration
+    # -----------------------------------------------------------------------
+
+    def _execute_migration(self, switch: Switch, source_ctrl: Controller,
+                           target_ctrl: Controller, data: dict) -> MigrationRecord:
+        """Execute the switch migration and record it with full paper metrics."""
+        dc_before = data.get("dc_before", 0)
+
+        # Capture global imbalance BEFORE migration
+        global_imb_before = self._global_imbalance()
+        loads_before = {c.id: round(c.load_percentage, 2)
+                        for c in self.controllers.values() if c.active}
+
+        # Perform migration
+        switch.controller_id = target_ctrl.id
+
+        # Recalculate loads
+        self.update_controller_levels()
+
+        dc_after = self._pairwise_imbalance(source_ctrl, target_ctrl)
+        global_imb_after = self._global_imbalance()
+        loads_after = {c.id: round(c.load_percentage, 2)
+                       for c in self.controllers.values() if c.active}
+
+        record = MigrationRecord(
+            timestamp=time.time(),
+            switch_id=switch.id,
+            source_controller=source_ctrl.id,
+            target_controller=target_ctrl.id,
+            source_load_before=data.get("src_load_before", source_ctrl.load_percentage),
+            source_load_after=source_ctrl.load_percentage,
+            target_load_before=data.get("tgt_load_before", target_ctrl.load_percentage),
+            target_load_after=target_ctrl.load_percentage,
+            migration_efficiency=data.get("efficiency", 0),
+            migration_cost=data.get("cost", 0),
+            imbalance_before=dc_before,
+            imbalance_after=dc_after,
+            # Paper metrics
+            psi_switch=data.get("psi_switch", 0),
+            psi_mean=data.get("psi_mean", 0),
+            rho_size=data.get("rho_size", 0),
+            domain_size=data.get("domain_size", 0),
+            dc_star=data.get("dc_star", 0),
+            dc_before_pair=dc_before,
+            dc_after_pair=dc_after,
+            theta=data.get("theta", 0),
+            cost_f=data.get("cost_f", 0),
+            pred_source_load=data.get("pred_src", 0),
+            pred_target_load=data.get("pred_tgt", 0),
+            target_level_star=data.get("target_level_star", 0),
+            global_imbalance_before=global_imb_before,
+            global_imbalance_after=global_imb_after,
+            all_loads_before=str(loads_before),
+            all_loads_after=str(loads_after),
+        )
+
+        self.migration_history.append(record)
+        self._write_eval_csv(record)
+
+        logger.info(
+            "Migration: %s %s→%s  DC: %.4f → %.4f  D_global: %.4f → %.4f",
+            switch.id, source_ctrl.id, target_ctrl.id,
+            dc_before, dc_after, global_imb_before, global_imb_after
+        )
+        return record
 
     # -----------------------------------------------------------------------
     # Algorithm 2: Load Balancing (Full)
@@ -360,189 +664,103 @@ class DLBMTEngine:
     def run_load_balancing(self) -> Optional[MigrationRecord]:
         """
         Algorithm 2: Complete load balancing algorithm.
-        
-        Steps:
+
         1. Update all controller levels
-        2. For controllers at idle/high/overload level, find migration candidates
-        3. Select best (switch, target_controller) pair based on migration efficiency
-        4. Execute migration
-        
-        Returns MigrationRecord if a migration was performed, None otherwise.
+        2. Find controllers in HIGH or OVERLOAD state
+        3. For each, find the best migration candidate (min DC*, R > θ)
+        4. Select globally best migration across all sources
+        5. Execute single greedy migration per cycle
         """
         # Step 1: Update levels
-        level_changes = self.update_controller_levels()
-
-        # Find controllers needing balancing (idle=1, high=3, overload=4)
-        source_controllers = []
-        for ctrl_id, ctrl in self.controllers.items():
-            if not ctrl.active:
-                continue
-            if ctrl.level in (ControllerLevel.HIGH, ControllerLevel.OVERLOAD):
-                source_controllers.append(ctrl)
-
-        # Also handle idle controllers (they can donate switches)
-        idle_controllers = [c for c in self.controllers.values()
-                           if c.active and c.level == ControllerLevel.IDLE]
-
-        if not source_controllers:
-            return None
-
-        best_pair = None
-        best_efficiency = float('inf')  # Lower efficiency = better pair (paper says "least efficiency")
-
-        for source_ctrl in source_controllers:
-            result = self._find_best_migration_for_source(source_ctrl)
-            if result is not None:
-                switch, target_ctrl, efficiency, record_data = result
-                if efficiency < best_efficiency:
-                    best_efficiency = efficiency
-                    best_pair = (switch, source_ctrl, target_ctrl, record_data)
-
-        if best_pair is None:
-            # No suitable migration found
-            # For overloaded controllers: would add new controller (sim limitation)
-            logger.info("No suitable migration found for any overloaded controller")
-            return None
-
-        # Execute migration
-        switch, source_ctrl, target_ctrl, record_data = best_pair
-        return self._execute_migration(switch, source_ctrl, target_ctrl, record_data)
-
-    def _find_best_migration_for_source(self, source_ctrl: Controller):
-        """
-        For a given source controller, find the best (switch, target) pair.
-        Implements Algorithm 2 steps 2-37.
-        """
-        domain_switches = self.get_switches_in_domain(source_ctrl.id)
-        if not domain_switches:
-            return None
-
-        # Steps 2-9: Find migration candidates (ρ)
-        # Compute ψ for all switches in domain
-        ratios = {}
-        for switch in domain_switches:
-            ratios[switch.id] = self.compute_migration_ratio(switch, source_ctrl)
-
-        if not ratios:
-            return None
-
-        avg_ratio = sum(ratios.values()) / len(ratios)
-
-        # Switches with ratio >= average are migration candidates
-        migration_candidates = [s for s in domain_switches if ratios[s.id] >= avg_ratio]
-
-        if not migration_candidates:
-            return None
-
-        # Steps 10-24: For each candidate switch, find best target controller
-        # Store pairs (switch, target_ctrl, dc_after)
-        valid_pairs = []
-
-        for switch in migration_candidates:
-            best_target = None
-            best_dc = float('inf')
-
-            for target_ctrl in self.get_active_controllers():
-                if target_ctrl.id == source_ctrl.id:
-                    continue
-                if target_ctrl.level not in (ControllerLevel.IDLE, ControllerLevel.NORMAL):
-                    continue
-
-                # Compute post-migration loads (Eq. 5, 6)
-                lr_source_after = self.compute_source_load_after_migration(
-                    source_ctrl, switch)
-                lr_target_after = self.compute_target_load_after_migration(
-                    target_ctrl, switch)
-
-                # Check target level after migration
-                target_level_after = self.determine_level(lr_target_after)
-                if target_level_after not in (ControllerLevel.IDLE, ControllerLevel.NORMAL):
-                    continue  # Remove from candidate list
-
-                # Compute average load after migration
-                active_ctrls = self.get_active_controllers()
-                total_load = sum(c.load_percentage for c in active_ctrls)
-                # Adjust total for the migration
-                total_load = total_load - source_ctrl.load_percentage + lr_source_after
-                total_load = total_load - target_ctrl.load_percentage + lr_target_after
-                avg_load_after = total_load / len(active_ctrls)
-
-                # Eq. 8: Degree of load imbalance after migration
-                dc_after = self.compute_degree_of_imbalance(
-                    lr_source_after, lr_target_after, avg_load_after)
-
-                if dc_after < best_dc:
-                    best_dc = dc_after
-                    best_target = target_ctrl
-                    best_record = {
-                        "lr_source_after": lr_source_after,
-                        "lr_target_after": lr_target_after,
-                        "dc_after": dc_after,
-                    }
-
-            if best_target is not None:
-                valid_pairs.append((switch, best_target, best_dc, best_record))
-
-        if not valid_pairs:
-            return None
-
-        # Steps 30-37: Among valid pairs, select the one with best (least) migration efficiency
-        best_result = None
-        best_efficiency = float('inf')
-
-        for switch, target_ctrl, dc_after, record_data in valid_pairs:
-            # Eq. 8: DC before migration
-            dc_before = self.compute_current_imbalance(source_ctrl.id, target_ctrl.id)
-
-            # Eq. 10: Migration cost
-            cost = self.compute_migration_cost(switch, target_ctrl)
-
-            # Eq. 9: Migration efficiency
-            efficiency = self.compute_migration_efficiency(dc_after, dc_before, cost)
-
-            if efficiency < best_efficiency:
-                best_efficiency = efficiency
-                record_data["dc_before"] = dc_before
-                record_data["cost"] = cost
-                record_data["efficiency"] = efficiency
-                best_result = (switch, target_ctrl, efficiency, record_data)
-
-        return best_result
-
-    def _execute_migration(self, switch: Switch, source_ctrl: Controller,
-                           target_ctrl: Controller, record_data: dict) -> MigrationRecord:
-        """Execute the switch migration and record it."""
-        src_load_before = source_ctrl.load_percentage
-        tgt_load_before = target_ctrl.load_percentage
-
-        # Perform migration
-        switch.controller_id = target_ctrl.id
-
-        # Recalculate loads
         self.update_controller_levels()
 
-        record = MigrationRecord(
-            timestamp=time.time(),
-            switch_id=switch.id,
-            source_controller=source_ctrl.id,
-            target_controller=target_ctrl.id,
-            source_load_before=src_load_before,
-            source_load_after=source_ctrl.load_percentage,
-            target_load_before=tgt_load_before,
-            target_load_after=target_ctrl.load_percentage,
-            migration_efficiency=record_data.get("efficiency", 0),
-            migration_cost=record_data.get("cost", 0),
-            imbalance_before=record_data.get("dc_before", 0),
-            imbalance_after=record_data.get("dc_after", 0),
-        )
+        # Trigger for HIGH (3) or OVERLOAD (4)
+        sources = [c for c in self.controllers.values()
+                   if c.active
+                   and c.level in (ControllerLevel.HIGH, ControllerLevel.OVERLOAD)]
 
-        self.migration_history.append(record)
-        logger.info(
-            f"Migration: {switch.id} from {source_ctrl.id} → {target_ctrl.id} | "
-            f"Src load: {src_load_before:.1f}→{source_ctrl.load_percentage:.1f} | "
-            f"Tgt load: {tgt_load_before:.1f}→{target_ctrl.load_percentage:.1f}"
-        )
-        return record
+        if not sources:
+            return None
+
+        # Find the globally best migration across all source controllers
+        best_pair = None
+        best_dc_star = float("inf")
+
+        for src in sources:
+            result = self._find_best_migration(src)
+            if result:
+                sw, tgt, theta, record_data = result
+                dc_star = record_data.get("dc_star", float("inf"))
+                if dc_star < best_dc_star:
+                    best_dc_star = dc_star
+                    best_pair = (sw, src, tgt, record_data)
+
+        if best_pair:
+            return self._execute_migration(*best_pair)
+
+        logger.info("No suitable migration found for any overloaded controller")
+        return None
+
+    # -----------------------------------------------------------------------
+    # CSV Evaluation Log
+    # -----------------------------------------------------------------------
+
+    _CSV_FILE = "logs.csv"
+    _CSV_HEADERS = [
+        "timestamp", "time_str", "migration_#",
+        "switch", "source", "target",
+        "src_load_before", "src_load_after",
+        "tgt_load_before", "tgt_load_after",
+        "pred_src_load", "pred_tgt_load",
+        "psi_switch", "psi_mean", "rho_size", "domain_size",
+        "DC_before", "DC_star", "DC_after",
+        "theta", "cost_f", "R_threshold",
+        "target_C_star",
+        "global_imb_before", "global_imb_after",
+        "all_loads_before", "all_loads_after",
+    ]
+
+    def _write_eval_csv(self, rec: MigrationRecord):
+        csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), self._CSV_FILE)
+        file_exists = os.path.isfile(csv_path)
+        try:
+            with open(csv_path, "a", newline="") as f:
+                w = csv.writer(f)
+                if not file_exists:
+                    w.writerow(self._CSV_HEADERS)
+
+                level_names = {1: "IDLE", 2: "NORMAL", 3: "HIGH", 4: "OVERLOAD"}
+                w.writerow([
+                    round(rec.timestamp, 3),
+                    time.strftime("%H:%M:%S", time.localtime(rec.timestamp)),
+                    len(self.migration_history),
+                    rec.switch_id,
+                    rec.source_controller,
+                    rec.target_controller,
+                    round(rec.source_load_before, 2),
+                    round(rec.source_load_after, 2),
+                    round(rec.target_load_before, 2),
+                    round(rec.target_load_after, 2),
+                    round(rec.pred_source_load, 2),
+                    round(rec.pred_target_load, 2),
+                    round(rec.psi_switch, 4),
+                    round(rec.psi_mean, 4),
+                    rec.rho_size,
+                    rec.domain_size,
+                    round(rec.dc_before_pair, 6),
+                    round(rec.dc_star, 6),
+                    round(rec.dc_after_pair, 6),
+                    round(rec.theta, 6),
+                    round(rec.cost_f, 6),
+                    EFFECTIVENESS_THRESHOLD_R,
+                    level_names.get(rec.target_level_star, "?"),
+                    round(rec.global_imbalance_before, 6),
+                    round(rec.global_imbalance_after, 6),
+                    rec.all_loads_before,
+                    rec.all_loads_after,
+                ])
+        except Exception as e:
+            logger.error("Failed to write eval CSV: %s", e)
 
     # -----------------------------------------------------------------------
     # Snapshot for time-series
@@ -553,22 +771,16 @@ class DLBMTEngine:
         active = self.get_active_controllers()
         avg_load = sum(c.load_percentage for c in active) / len(active) if active else 0
 
-        # Compute global imbalance
-        if active and avg_load > 0:
-            variance = sum((c.load_percentage - avg_load) ** 2 for c in active) / len(active)
-            global_imbalance = math.sqrt(variance) / avg_load
-        else:
-            global_imbalance = 0
-
         snapshot = {
             "timestamp": time.time(),
             "controllers": {c.id: {
                 "load": round(c.load_percentage, 2),
                 "level": c.level.value,
                 "level_label": c.level.label,
+                "level_color": c.level.color,
             } for c in active},
             "avg_load": round(avg_load, 2),
-            "global_imbalance": round(global_imbalance, 4),
+            "global_imbalance": round(self._global_imbalance(), 4),
             "total_switches": len(self.switches),
             "total_migrations": len(self.migration_history),
         }
@@ -585,12 +797,6 @@ class DLBMTEngine:
         active = self.get_active_controllers()
         avg_load = sum(c.load_percentage for c in active) / len(active) if active else 0
 
-        if active and avg_load > 0:
-            variance = sum((c.load_percentage - avg_load) ** 2 for c in active) / len(active)
-            global_imbalance = math.sqrt(variance) / avg_load
-        else:
-            global_imbalance = 0
-
         # Controller domain sizes
         domain_sizes = {}
         for ctrl in active:
@@ -598,7 +804,7 @@ class DLBMTEngine:
 
         return {
             "avg_load": round(avg_load, 2),
-            "global_imbalance": round(global_imbalance, 4),
+            "global_imbalance": round(self._global_imbalance(), 4),
             "total_controllers": len(active),
             "total_switches": len(self.switches),
             "total_migrations": len(self.migration_history),
